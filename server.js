@@ -3,13 +3,14 @@ const crypto = require('crypto');
 const url = require('url');
 
 const config = {
-    host: 'tv.plat4k.tv',
-    mac_address: '00:1A:79:00:04:04',
-    serial_number: 'AF130C6FE418A',
-    device_id: '2B07007A2490C046C0836093B982C8917DF263B1900AF6ACC936818D8500092F',
-    device_id_2: '2B07007A2490C046C0836093B982C8917DF263B1900AF6ACC936818D8500092F',
-    stb_type: 'MAG250',
+    host: '89.187.191.54',
+    mac_address: '00:1A:79:00:00:44',
+    serial_number: 'FB9673E993545',
+    device_id: 'C9CB1802CB7821F8F5C7BF991022D4938E27C304C1B5801DBB90EA8A18215004',
+    device_id_2: '6BB249F5401CAF10FB54F43C842BEF5800938E749BEED2ABC841A1BBC2063087',
+    stb_type: 'MAG270',
     api_signature: '263',
+    signature: '05500ADBF95D130335B2A1B4D806D7D6798CE4AE68B18BB92C7AFF89F755E366'
 };
 
 let hw_version = '';
@@ -31,14 +32,17 @@ function getHeaders(token = '') {
         'Referer': `http://${config.host}/stalker_portal/c/`,
         'Accept': 'application/json, text/javascript, */*; q=0.01',
         'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Charset': 'UTF-8,*;q=0.8',
         'Connection': 'keep-alive',
         'Cookie': `mac=${config.mac_address}; stb_lang=en; timezone=GMT`,
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
     };
     if (token) headers['Authorization'] = `Bearer ${token}`;
     return headers;
 }
 
-function fetchUrl(urlStr, headers) {
+function fetchUrl(urlStr, headers, retries = 2) {
     return new Promise((resolve, reject) => {
         const parsed = new url.URL(urlStr);
         const options = {
@@ -47,14 +51,37 @@ function fetchUrl(urlStr, headers) {
             path: parsed.pathname + parsed.search,
             method: 'GET',
             headers: headers,
-            timeout: 15000
+            timeout: 20000
         };
+        
         const req = http.request(options, (res) => {
             let data = '';
             res.on('data', chunk => data += chunk);
-            res.on('end', () => resolve({ status: res.statusCode, data }));
+            res.on('end', () => {
+                if (res.statusCode === 200) {
+                    resolve({ status: res.statusCode, data });
+                } else if (retries > 0 && (res.statusCode === 403 || res.statusCode === 429)) {
+                    console.log(`Retry ${retries}...`);
+                    setTimeout(() => {
+                        fetchUrl(urlStr, headers, retries - 1).then(resolve).catch(reject);
+                    }, 2000);
+                } else {
+                    resolve({ status: res.statusCode, data });
+                }
+            });
         });
-        req.on('error', (e) => reject(new Error(`Fetch error: ${e.message}`)));
+        
+        req.on('error', (e) => {
+            if (retries > 0) {
+                console.log(`Retry ${retries}...`);
+                setTimeout(() => {
+                    fetchUrl(urlStr, headers, retries - 1).then(resolve).catch(reject);
+                }, 2000);
+            } else {
+                reject(e);
+            }
+        });
+        
         req.end();
     });
 }
@@ -66,24 +93,23 @@ async function genToken() {
         stb_type: config.stb_type, device_id: config.device_id, device_id2: config.device_id_2
     });
     const urlStr = `http://${config.host}/stalker_portal/server/load.php?${params}`;
-    console.log(`[genToken] Requesting: ${urlStr.substring(0, 100)}...`);
+    console.log(`[Token] Requesting...`);
     
     try {
         const { status, data } = await fetchUrl(urlStr, getHeaders());
-        console.log(`[genToken] Response status: ${status}`);
-        console.log(`[genToken] Response preview: ${data.substring(0, 200)}`);
+        console.log(`[Token] Status: ${status}`);
         
         if (status !== 200) {
-            console.error(`[genToken] HTTP ${status}`);
+            console.log(`[Token] Failed with status ${status}`);
             return null;
         }
         
         const jsonData = JSON.parse(data);
         const token = jsonData.js?.token || jsonData.token;
-        console.log(`[genToken] Token obtained: ${token ? token.substring(0, 20) + '...' : 'null'}`);
+        console.log(`[Token] Success: ${token ? token.substring(0,20)+'...' : 'null'}`);
         return token;
     } catch (e) {
-        console.error(`[genToken] Error: ${e.message}`);
+        console.error(`[Token] Error: ${e.message}`);
         return null;
     }
 }
@@ -94,23 +120,16 @@ async function auth(token) {
         type: 'stb', action: 'get_profile', hd: '1', sn: config.serial_number,
         stb_type: config.stb_type, device_id: config.device_id, device_id2: config.device_id_2,
         hw_version: hw_version, hw_version_2: hw_version_2, api_signature: config.api_signature,
-        metrics: metrics, JsHttpRequest: '1-xml'
+        signature: config.signature, metrics: metrics, JsHttpRequest: '1-xml'
     });
     const urlStr = `http://${config.host}/stalker_portal/server/load.php?${params}`;
-    console.log(`[auth] Authenticating...`);
     
     try {
         const { status, data } = await fetchUrl(urlStr, getHeaders(token));
-        console.log(`[auth] Response status: ${status}`);
-        console.log(`[auth] Response preview: ${data.substring(0, 200)}`);
-        
         if (status !== 200) return false;
         const jsonData = JSON.parse(data);
-        const hasId = !!(jsonData.js || jsonData).id;
-        console.log(`[auth] Success: ${hasId}`);
-        return hasId;
+        return !!(jsonData.js || jsonData).id;
     } catch (e) {
-        console.error(`[auth] Error: ${e.message}`);
         return false;
     }
 }
@@ -118,20 +137,13 @@ async function auth(token) {
 async function getChannels(token) {
     const params = new URLSearchParams({ type: 'itv', action: 'get_all_channels', JsHttpRequest: '1-xml' });
     const urlStr = `http://${config.host}/stalker_portal/server/load.php?${params}`;
-    console.log(`[getChannels] Fetching channels...`);
     
     try {
         const { status, data } = await fetchUrl(urlStr, getHeaders(token));
-        if (status !== 200) {
-            console.error(`[getChannels] HTTP ${status}`);
-            return [];
-        }
+        if (status !== 200) return [];
         const jsonData = JSON.parse(data);
-        const channels = jsonData.js?.data || jsonData.js || [];
-        console.log(`[getChannels] Found ${channels.length} channels`);
-        return channels;
+        return jsonData.js?.data || jsonData.js || [];
     } catch (e) {
-        console.error(`[getChannels] Error: ${e.message}`);
         return [];
     }
 }
@@ -153,50 +165,37 @@ async function getGenres(token) {
 const server = http.createServer(async (req, res) => {
     const parsedUrl = url.parse(req.url, true);
     
-    console.log(`[Request] ${req.method} ${req.url}`);
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
     
+    // Health check
     if (parsedUrl.pathname === '/health') {
         res.writeHead(200);
         res.end('OK');
         return;
     }
     
+    // Root endpoint - return M3U
     try {
         generateHardwareVersions();
         
         const token = await genToken();
-        if (!token) {
-            console.error('[Error] Failed to get token');
-            res.writeHead(500);
-            res.end('Failed to authenticate with portal');
-            return;
-        }
+        if (!token) throw new Error('No token - portal may be blocking');
         
         const authSuccess = await auth(token);
-        if (!authSuccess) {
-            console.error('[Error] Authentication failed');
-            res.writeHead(500);
-            res.end('Authentication failed');
-            return;
-        }
+        if (!authSuccess) throw new Error('Authentication failed');
         
         const [channels, genres] = await Promise.all([
             getChannels(token),
             getGenres(token)
         ]);
         
-        if (!channels || channels.length === 0) {
-            console.error('[Error] No channels found');
-            res.writeHead(500);
-            res.end('No channels found from portal');
-            return;
-        }
+        if (!channels || channels.length === 0) throw new Error('No channels found');
         
         const categoryMap = {};
         genres.forEach(g => { if (g.id) categoryMap[String(g.id)] = g.title || g.alias; });
         
         let m3u = '#EXTM3U\n';
-        let channelCount = 0;
+        let count = 0;
         
         for (const ch of channels) {
             const id = ch.id || ch.channel_id || ch.itv_id;
@@ -206,20 +205,23 @@ const server = http.createServer(async (req, res) => {
             const groupTitle = categoryMap[genreId] || ch.genre || ch.category || 'TV Channels';
             const logo = ch.logo || ch.tvg_logo || '';
             m3u += `#EXTINF:-1 tvg-id="${id}" tvg-name="${name}" tvg-logo="${logo}" group-title="${groupTitle}",${name}\n`;
-            m3u += `${process.env.RENDER_EXTERNAL_URL || `https://iptv-playlist-bbre.onrender.com`}/?play_id=${id}\n`;
-            channelCount++;
+            m3u += `http://${config.host}/stalker_portal/server/load.php?type=itv&action=create_link&cmd=ffrt%20http://localhost/ch/${id}&JsHttpRequest=1-xml&Authorization=Bearer%20${token}\n`;
+            count++;
         }
         
-        console.log(`[Success] Generated playlist with ${channelCount} channels`);
+        console.log(`Success: ${count} channels generated`);
         res.writeHead(200, { 'Content-Type': 'application/x-mpegurl' });
         res.end(m3u);
         
     } catch (e) {
-        console.error(`[Fatal Error] ${e.message}`);
+        console.error(`Error: ${e.message}`);
         res.writeHead(500);
         res.end(`Error: ${e.message}`);
     }
 });
 
 const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log(`URL: http://localhost:${PORT}`);
+});
