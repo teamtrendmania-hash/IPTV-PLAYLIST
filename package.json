@@ -1,5 +1,5 @@
 {
-  "name": "stalker-to-m3u",
+  "name": "xtream-proxy",
   "version": "1.0.0",
   "type": "module",
   "main": "server.js",
@@ -7,6 +7,6 @@
     "start": "node server.js"
   },
   "engines": {
-    "node": "18.x"
+    "node": "20.x"
   }
 }
