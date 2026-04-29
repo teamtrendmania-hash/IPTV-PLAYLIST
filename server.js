@@ -1,9 +1,6 @@
-const http = require('http');
-const https = require('https');
-const url = require('url');
-
-// Your portal's direct M3U link (if available)
-// Since we don't have a direct M3U, we'll use the Stalker API to get channels
+import crypto from 'crypto';
+import http from 'http';
+import url from 'url';
 
 const config = {
     host: '89.187.191.54',
@@ -67,7 +64,9 @@ function fetchUrl(urlStr, headers) {
 }
 
 async function getToken() {
-    if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
+    if (cachedToken && Date.now() < tokenExpiry) {
+        return cachedToken;
+    }
     
     const params = new URLSearchParams({
         type: 'stb', action: 'handshake', JsHttpRequest: '1-xml',
@@ -83,14 +82,16 @@ async function getToken() {
         if (token) {
             cachedToken = token;
             tokenExpiry = Date.now() + 55 * 60 * 1000;
+            console.log('Token obtained successfully');
         }
         return token;
     } catch (e) {
+        console.error('Token error:', e.message);
         return null;
     }
 }
 
-async function getChannelsList(token) {
+async function getChannels(token) {
     if (cachedChannels && Date.now() - channelCacheTime < 60 * 60 * 1000) {
         return cachedChannels;
     }
@@ -104,66 +105,86 @@ async function getChannelsList(token) {
         const channels = jsonData.js?.data || jsonData.js || [];
         cachedChannels = channels;
         channelCacheTime = Date.now();
+        console.log(`Found ${channels.length} channels`);
         return channels;
     } catch (e) {
+        console.error('Channels error:', e.message);
         return [];
+    }
+}
+
+async function getStreamUrl(token, channelId) {
+    const params = new URLSearchParams({ 
+        type: 'itv', 
+        action: 'create_link', 
+        cmd: `ffrt http://localhost/ch/${channelId}`, 
+        JsHttpRequest: '1-xml' 
+    });
+    const urlStr = `http://${config.host}/stalker_portal/server/load.php?${params}`;
+    
+    try {
+        const { data } = await fetchUrl(urlStr, getHeaders(token));
+        const jsonData = JSON.parse(data);
+        const streamUrl = (jsonData.js?.cmd || '').replace(/ffrt\s+/g, '').trim();
+        return streamUrl || null;
+    } catch (e) {
+        return null;
     }
 }
 
 const server = http.createServer(async (req, res) => {
     const parsedUrl = url.parse(req.url, true);
     
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+    console.log(`${req.method} ${req.url}`);
     
+    // Health check for Render
     if (parsedUrl.pathname === '/health') {
         res.writeHead(200);
         res.end('OK');
         return;
     }
     
-    // Direct stream proxy
-    if (parsedUrl.pathname === '/stream' && parsedUrl.query.id && parsedUrl.query.token) {
-        const streamUrl = `http://89.187.191.54/stalker_portal/server/load.php?type=itv&action=create_link&cmd=ffrt%20http://localhost/ch/${parsedUrl.query.id}&JsHttpRequest=1-xml&Authorization=Bearer%20${parsedUrl.query.token}`;
-        
+    // Stream proxy
+    if (parsedUrl.pathname === '/stream' && parsedUrl.query.id) {
         try {
-            const { data } = await fetchUrl(streamUrl, getHeaders(parsedUrl.query.token));
-            const jsonData = JSON.parse(data);
-            const realUrl = (jsonData.js?.cmd || '').replace(/ffrt\s+/g, '').trim();
-            if (realUrl) {
-                res.writeHead(302, { 'Location': realUrl });
+            generateHardwareVersions();
+            const token = await getToken();
+            if (!token) throw new Error('No token');
+            const streamUrl = await getStreamUrl(token, parsedUrl.query.id);
+            if (streamUrl && streamUrl.startsWith('http')) {
+                res.writeHead(302, { 'Location': streamUrl });
                 res.end();
-                return;
+            } else {
+                res.writeHead(404);
+                res.end('Stream not found');
             }
-        } catch (e) {}
-        
-        res.writeHead(404);
-        res.end('Stream not found');
+        } catch (e) {
+            res.writeHead(500);
+            res.end(`Error: ${e.message}`);
+        }
         return;
     }
     
-    // Main M3U generation
+    // Main M3U endpoint
     try {
         generateHardwareVersions();
         const token = await getToken();
-        if (!token) throw new Error('No token');
+        if (!token) throw new Error('Failed to get token');
         
-        const channels = await getChannelsList(token);
+        const channels = await getChannels(token);
         
         let m3u = '#EXTM3U\n';
         let count = 0;
         
-        // Generate playlist with proxy URLs
         for (const ch of channels) {
             const id = ch.id || ch.channel_id || ch.itv_id;
             if (!id) continue;
             const name = ch.name || ch.title || 'Unknown';
+            const logo = ch.logo || '';
             
-            m3u += `#EXTINF:-1,${name}\n`;
-            m3u += `https://${req.headers.host}/stream?id=${id}&token=${token}\n`;
+            m3u += `#EXTINF:-1 tvg-id="${id}" tvg-name="${name}" tvg-logo="${logo}",${name}\n`;
+            m3u += `https://${req.headers.host}/stream?id=${id}\n`;
             count++;
-            
-            // Limit to prevent timeout
-            if (count >= 500) break;
         }
         
         console.log(`Served ${count} channels`);
@@ -178,4 +199,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log(`URL: https://your-app.onrender.com`);
+});
