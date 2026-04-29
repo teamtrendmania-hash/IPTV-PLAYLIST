@@ -15,6 +15,8 @@ const config = {
 
 let hw_version = '';
 let hw_version_2 = '';
+let cachedToken = null;
+let tokenExpiry = 0;
 
 function calcMd5(s) {
     return crypto.createHash('md5').update(s || 'default').digest('hex');
@@ -61,7 +63,6 @@ function fetchUrl(urlStr, headers, retries = 2) {
                 if (res.statusCode === 200) {
                     resolve({ status: res.statusCode, data });
                 } else if (retries > 0 && (res.statusCode === 403 || res.statusCode === 429)) {
-                    console.log(`Retry ${retries}...`);
                     setTimeout(() => {
                         fetchUrl(urlStr, headers, retries - 1).then(resolve).catch(reject);
                     }, 2000);
@@ -73,7 +74,6 @@ function fetchUrl(urlStr, headers, retries = 2) {
         
         req.on('error', (e) => {
             if (retries > 0) {
-                console.log(`Retry ${retries}...`);
                 setTimeout(() => {
                     fetchUrl(urlStr, headers, retries - 1).then(resolve).catch(reject);
                 }, 2000);
@@ -87,29 +87,31 @@ function fetchUrl(urlStr, headers, retries = 2) {
 }
 
 async function genToken() {
+    // Return cached token if still valid (55 minutes)
+    if (cachedToken && Date.now() < tokenExpiry) {
+        console.log('[Token] Using cached token');
+        return cachedToken;
+    }
+    
     const params = new URLSearchParams({
         type: 'stb', action: 'handshake', JsHttpRequest: '1-xml',
         mac: config.mac_address, sn: config.serial_number,
         stb_type: config.stb_type, device_id: config.device_id, device_id2: config.device_id_2
     });
     const urlStr = `http://${config.host}/stalker_portal/server/load.php?${params}`;
-    console.log(`[Token] Requesting...`);
     
     try {
         const { status, data } = await fetchUrl(urlStr, getHeaders());
-        console.log(`[Token] Status: ${status}`);
-        
-        if (status !== 200) {
-            console.log(`[Token] Failed with status ${status}`);
-            return null;
-        }
-        
+        if (status !== 200) return null;
         const jsonData = JSON.parse(data);
         const token = jsonData.js?.token || jsonData.token;
-        console.log(`[Token] Success: ${token ? token.substring(0,20)+'...' : 'null'}`);
+        if (token) {
+            cachedToken = token;
+            tokenExpiry = Date.now() + 55 * 60 * 1000; // 55 minutes
+            console.log(`[Token] New token obtained`);
+        }
         return token;
     } catch (e) {
-        console.error(`[Token] Error: ${e.message}`);
         return null;
     }
 }
@@ -162,6 +164,43 @@ async function getGenres(token) {
     }
 }
 
+// Pre-fetch stream URLs for all channels and cache them
+let streamUrlCache = new Map();
+let isCaching = false;
+
+async function getStreamUrl(token, channelId) {
+    // Check cache
+    if (streamUrlCache.has(channelId)) {
+        return streamUrlCache.get(channelId);
+    }
+    
+    const params = new URLSearchParams({ 
+        type: 'itv', 
+        action: 'create_link', 
+        cmd: `ffrt http://localhost/ch/${channelId}`, 
+        JsHttpRequest: '1-xml' 
+    });
+    const urlStr = `http://${config.host}/stalker_portal/server/load.php?${params}`;
+    
+    try {
+        const { status, data } = await fetchUrl(urlStr, getHeaders(token));
+        if (status !== 200) return null;
+        const jsonData = JSON.parse(data);
+        const streamUrl = (jsonData.js?.cmd || '').replace(/ffrt\s+/g, '').trim();
+        if (streamUrl) {
+            streamUrlCache.set(channelId, streamUrl);
+        }
+        return streamUrl;
+    } catch (e) {
+        return null;
+    }
+}
+
+// Cache for playlist
+let cachedPlaylist = null;
+let playlistCacheTime = 0;
+const PLAYLIST_CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 hours
+
 const server = http.createServer(async (req, res) => {
     const parsedUrl = url.parse(req.url, true);
     
@@ -174,42 +213,77 @@ const server = http.createServer(async (req, res) => {
         return;
     }
     
-    // Root endpoint - return M3U
+    // Check if playlist is cached
+    if (cachedPlaylist && Date.now() - playlistCacheTime < PLAYLIST_CACHE_DURATION) {
+        console.log('[Cache] Serving cached playlist');
+        res.writeHead(200, { 'Content-Type': 'application/x-mpegurl' });
+        res.end(cachedPlaylist);
+        return;
+    }
+    
     try {
         generateHardwareVersions();
         
         const token = await genToken();
-        if (!token) throw new Error('No token - portal may be blocking');
+        if (!token) throw new Error('No token');
         
         const authSuccess = await auth(token);
-        if (!authSuccess) throw new Error('Authentication failed');
+        if (!authSuccess) throw new Error('Auth failed');
         
         const [channels, genres] = await Promise.all([
             getChannels(token),
             getGenres(token)
         ]);
         
-        if (!channels || channels.length === 0) throw new Error('No channels found');
+        if (!channels || channels.length === 0) throw new Error('No channels');
         
         const categoryMap = {};
         genres.forEach(g => { if (g.id) categoryMap[String(g.id)] = g.title || g.alias; });
         
-        let m3u = '#EXTM3U\n';
-        let count = 0;
+        // Build category to channel mapping
+        const categoryChannels = new Map();
         
         for (const ch of channels) {
             const id = ch.id || ch.channel_id || ch.itv_id;
             if (!id) continue;
-            const name = ch.name || ch.title || 'Unknown';
             const genreId = String(ch.tv_genre_id || ch.genre_id || ch.category_id || '');
             const groupTitle = categoryMap[genreId] || ch.genre || ch.category || 'TV Channels';
-            const logo = ch.logo || ch.tvg_logo || '';
-            m3u += `#EXTINF:-1 tvg-id="${id}" tvg-name="${name}" tvg-logo="${logo}" group-title="${groupTitle}",${name}\n`;
-            m3u += `http://${config.host}/stalker_portal/server/load.php?type=itv&action=create_link&cmd=ffrt%20http://localhost/ch/${id}&JsHttpRequest=1-xml&Authorization=Bearer%20${token}\n`;
-            count++;
+            
+            if (!categoryChannels.has(groupTitle)) {
+                categoryChannels.set(groupTitle, []);
+            }
+            categoryChannels.get(groupTitle).push(ch);
         }
         
-        console.log(`Success: ${count} channels generated`);
+        // Generate M3U with direct stream URLs (pre-fetch first 10 channels per category)
+        let m3u = '#EXTM3U\n';
+        let totalChannels = 0;
+        
+        for (const [groupTitle, groupChannels] of categoryChannels) {
+            m3u += `\n# Genre: ${groupTitle}\n`;
+            
+            for (const ch of groupChannels.slice(0, 100)) { // Limit to 100 per category for performance
+                const id = ch.id || ch.channel_id || ch.itv_id;
+                const name = ch.name || ch.title || 'Unknown';
+                const logo = ch.logo || ch.tvg_logo || '';
+                
+                // Get stream URL (will be cached)
+                const streamUrl = await getStreamUrl(token, id);
+                
+                if (streamUrl) {
+                    m3u += `#EXTINF:-1 tvg-id="${id}" tvg-name="${name}" tvg-logo="${logo}" group-title="${groupTitle}",${name}\n`;
+                    m3u += `${streamUrl}\n`;
+                    totalChannels++;
+                }
+            }
+        }
+        
+        console.log(`Generated ${totalChannels} channels`);
+        
+        // Cache the playlist
+        cachedPlaylist = m3u;
+        playlistCacheTime = Date.now();
+        
         res.writeHead(200, { 'Content-Type': 'application/x-mpegurl' });
         res.end(m3u);
         
