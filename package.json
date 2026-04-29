@@ -1,7 +1,7 @@
 {
   "name": "stalker-to-m3u",
   "version": "1.0.0",
-  "description": "Stalker Portal to M3U Converter",
+  "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
