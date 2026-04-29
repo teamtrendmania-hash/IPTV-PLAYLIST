@@ -1,5 +1,4 @@
 const http = require('http');
-const https = require('https');
 const crypto = require('crypto');
 const url = require('url');
 
@@ -55,7 +54,7 @@ function fetchUrl(urlStr, headers) {
             res.on('data', chunk => data += chunk);
             res.on('end', () => resolve({ status: res.statusCode, data }));
         });
-        req.on('error', reject);
+        req.on('error', (e) => reject(new Error(`Fetch error: ${e.message}`)));
         req.end();
     });
 }
@@ -67,11 +66,24 @@ async function genToken() {
         stb_type: config.stb_type, device_id: config.device_id, device_id2: config.device_id_2
     });
     const urlStr = `http://${config.host}/stalker_portal/server/load.php?${params}`;
+    console.log(`[genToken] Requesting: ${urlStr.substring(0, 100)}...`);
+    
     try {
-        const { data } = await fetchUrl(urlStr, getHeaders());
+        const { status, data } = await fetchUrl(urlStr, getHeaders());
+        console.log(`[genToken] Response status: ${status}`);
+        console.log(`[genToken] Response preview: ${data.substring(0, 200)}`);
+        
+        if (status !== 200) {
+            console.error(`[genToken] HTTP ${status}`);
+            return null;
+        }
+        
         const jsonData = JSON.parse(data);
-        return jsonData.js?.token || jsonData.token || null;
+        const token = jsonData.js?.token || jsonData.token;
+        console.log(`[genToken] Token obtained: ${token ? token.substring(0, 20) + '...' : 'null'}`);
+        return token;
     } catch (e) {
+        console.error(`[genToken] Error: ${e.message}`);
         return null;
     }
 }
@@ -85,11 +97,20 @@ async function auth(token) {
         metrics: metrics, JsHttpRequest: '1-xml'
     });
     const urlStr = `http://${config.host}/stalker_portal/server/load.php?${params}`;
+    console.log(`[auth] Authenticating...`);
+    
     try {
-        const { data } = await fetchUrl(urlStr, getHeaders(token));
+        const { status, data } = await fetchUrl(urlStr, getHeaders(token));
+        console.log(`[auth] Response status: ${status}`);
+        console.log(`[auth] Response preview: ${data.substring(0, 200)}`);
+        
+        if (status !== 200) return false;
         const jsonData = JSON.parse(data);
-        return !!(jsonData.js || jsonData).id;
+        const hasId = !!(jsonData.js || jsonData).id;
+        console.log(`[auth] Success: ${hasId}`);
+        return hasId;
     } catch (e) {
+        console.error(`[auth] Error: ${e.message}`);
         return false;
     }
 }
@@ -97,11 +118,20 @@ async function auth(token) {
 async function getChannels(token) {
     const params = new URLSearchParams({ type: 'itv', action: 'get_all_channels', JsHttpRequest: '1-xml' });
     const urlStr = `http://${config.host}/stalker_portal/server/load.php?${params}`;
+    console.log(`[getChannels] Fetching channels...`);
+    
     try {
-        const { data } = await fetchUrl(urlStr, getHeaders(token));
+        const { status, data } = await fetchUrl(urlStr, getHeaders(token));
+        if (status !== 200) {
+            console.error(`[getChannels] HTTP ${status}`);
+            return [];
+        }
         const jsonData = JSON.parse(data);
-        return jsonData.js?.data || jsonData.js || [];
+        const channels = jsonData.js?.data || jsonData.js || [];
+        console.log(`[getChannels] Found ${channels.length} channels`);
+        return channels;
     } catch (e) {
+        console.error(`[getChannels] Error: ${e.message}`);
         return [];
     }
 }
@@ -109,8 +139,10 @@ async function getChannels(token) {
 async function getGenres(token) {
     const params = new URLSearchParams({ type: 'itv', action: 'get_genres', JsHttpRequest: '1-xml' });
     const urlStr = `http://${config.host}/stalker_portal/server/load.php?${params}`;
+    
     try {
-        const { data } = await fetchUrl(urlStr, getHeaders(token));
+        const { status, data } = await fetchUrl(urlStr, getHeaders(token));
+        if (status !== 200) return [];
         const jsonData = JSON.parse(data);
         return jsonData.js || [];
     } catch (e) {
@@ -118,20 +150,10 @@ async function getGenres(token) {
     }
 }
 
-async function getStreamUrl(token, channelId) {
-    const params = new URLSearchParams({ type: 'itv', action: 'create_link', cmd: `ffrt http://localhost/ch/${channelId}`, JsHttpRequest: '1-xml' });
-    const urlStr = `http://${config.host}/stalker_portal/server/load.php?${params}`;
-    try {
-        const { data } = await fetchUrl(urlStr, getHeaders(token));
-        const jsonData = JSON.parse(data);
-        return (jsonData.js?.cmd || '').replace(/ffrt\s+/g, '').trim();
-    } catch (e) {
-        return null;
-    }
-}
-
 const server = http.createServer(async (req, res) => {
     const parsedUrl = url.parse(req.url, true);
+    
+    console.log(`[Request] ${req.method} ${req.url}`);
     
     if (parsedUrl.pathname === '/health') {
         res.writeHead(200);
@@ -139,38 +161,43 @@ const server = http.createServer(async (req, res) => {
         return;
     }
     
-    if (parsedUrl.pathname === '/' && parsedUrl.query.play_id) {
-        try {
-            generateHardwareVersions();
-            const token = await genToken();
-            if (!token) { res.writeHead(401); res.end('Auth failed'); return; }
-            await auth(token);
-            const streamUrl = await getStreamUrl(token, parsedUrl.query.play_id);
-            if (streamUrl) {
-                res.writeHead(302, { 'Location': streamUrl });
-                res.end();
-            } else {
-                res.writeHead(404);
-                res.end('Stream not found');
-            }
-        } catch (e) {
-            res.writeHead(500);
-            res.end('Error');
-        }
-        return;
-    }
-    
     try {
         generateHardwareVersions();
+        
         const token = await genToken();
-        if (!token) { throw new Error('No token'); }
-        await auth(token);
-        const [channels, genres] = await Promise.all([getChannels(token), getGenres(token)]);
+        if (!token) {
+            console.error('[Error] Failed to get token');
+            res.writeHead(500);
+            res.end('Failed to authenticate with portal');
+            return;
+        }
+        
+        const authSuccess = await auth(token);
+        if (!authSuccess) {
+            console.error('[Error] Authentication failed');
+            res.writeHead(500);
+            res.end('Authentication failed');
+            return;
+        }
+        
+        const [channels, genres] = await Promise.all([
+            getChannels(token),
+            getGenres(token)
+        ]);
+        
+        if (!channels || channels.length === 0) {
+            console.error('[Error] No channels found');
+            res.writeHead(500);
+            res.end('No channels found from portal');
+            return;
+        }
         
         const categoryMap = {};
         genres.forEach(g => { if (g.id) categoryMap[String(g.id)] = g.title || g.alias; });
         
         let m3u = '#EXTM3U\n';
+        let channelCount = 0;
+        
         for (const ch of channels) {
             const id = ch.id || ch.channel_id || ch.itv_id;
             if (!id) continue;
@@ -179,16 +206,20 @@ const server = http.createServer(async (req, res) => {
             const groupTitle = categoryMap[genreId] || ch.genre || ch.category || 'TV Channels';
             const logo = ch.logo || ch.tvg_logo || '';
             m3u += `#EXTINF:-1 tvg-id="${id}" tvg-name="${name}" tvg-logo="${logo}" group-title="${groupTitle}",${name}\n`;
-            m3u += `${process.env.RENDER_EXTERNAL_URL || `http://localhost:3000`}/?play_id=${id}\n`;
+            m3u += `${process.env.RENDER_EXTERNAL_URL || `https://iptv-playlist-bbre.onrender.com`}/?play_id=${id}\n`;
+            channelCount++;
         }
         
+        console.log(`[Success] Generated playlist with ${channelCount} channels`);
         res.writeHead(200, { 'Content-Type': 'application/x-mpegurl' });
         res.end(m3u);
+        
     } catch (e) {
+        console.error(`[Fatal Error] ${e.message}`);
         res.writeHead(500);
         res.end(`Error: ${e.message}`);
     }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
