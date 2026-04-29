@@ -1,5 +1,5 @@
 {
-  "name": "iptv-playlist",
+  "name": "stalker-to-m3u",
   "version": "1.0.0",
   "description": "Stalker Portal to M3U Converter",
   "main": "server.js",
@@ -7,6 +7,6 @@
     "start": "node server.js"
   },
   "engines": {
-    "node": ">=20.0.0 <22.0.0"
+    "node": "18.x"
   }
 }
