@@ -3,7 +3,7 @@ import https from 'https';
 import url from 'url';
 
 // Your Xtream Codes credentials
-const XTREAM_URL = 'http://servpremium.net:8880/get.php?username=luis747393&password=ZWxyWWjfvFfT&type=m3u_plus';
+const XTREAM_URL = 'http://starhub.pro:8080/get.php?username=8811&password=1188&type=m3u';
 
 // Cache the playlist to avoid hitting the portal too often
 let cachedPlaylist = null;
